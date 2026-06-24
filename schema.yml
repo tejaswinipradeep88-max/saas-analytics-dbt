@@ -1,0 +1,151 @@
+version: 2
+
+models:
+
+  - name: fact_events_daily
+    description: >
+      Mart-layer daily activity fact table. Grain: one row per user per calendar day (UTC).
+
+      Built from raw.events joined to raw.users and raw.accounts.
+      Activation logic, churn risk flags, and rolling window metrics are computed here
+      and should not be redefined in downstream BI tools or ad-hoc queries.
+
+      Materialized as incremental (append + merge on activity_date + user_id).
+      Refreshes every 6 hours via the scheduled dbt run.
+
+      Owners: analytics-eng
+      Downstream consumers: Looker (growth dashboard), Amplitude cohort exports,
+                            CSM churn-risk Slack alerts, exec weekly digest.
+
+    config:
+      materialized: incremental
+      unique_key:
+        - activity_date
+        - user_id
+      incremental_strategy: merge
+      cluster_by:
+        - activity_date
+        - plan_tier
+
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - activity_date
+            - user_id
+
+    columns:
+
+      - name: activity_date
+        description: >
+          Calendar date (UTC) on which the user had at least one event.
+          Derived from CONVERT_TIMEZONE('UTC', event_ts)::DATE.
+        tests:
+          - not_null
+
+      - name: user_id
+        description: >
+          FK to raw.users. Unique within each activity_date partition.
+        tests:
+          - not_null
+          - relationships:
+              to: source('raw', 'users')
+              field: user_id
+
+      - name: account_id
+        description: >
+          FK to raw.accounts. Inherited from raw.users at query time.
+          Null for individual self-serve users with no org affiliation.
+
+      - name: plan_tier
+        description: >
+          Subscription tier of the user on the activity_date.
+          Snapshotted at model run time — not a slowly-changing dimension.
+          Use with caution for historical cohort analysis on long date ranges.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['free', 'starter', 'growth', 'enterprise']
+
+      - name: signup_channel
+        description: Last-touch acquisition channel inherited from raw.users.
+
+      - name: company_size_band
+        description: >
+          Employee headcount band from raw.accounts. Null for self-serve users.
+
+      - name: mrr
+        description: >
+          MRR of the parent account in USD. Zero for free-tier accounts.
+          Not suitable for revenue reporting — use the billing fact table instead.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: total_events
+        description: Count of all event rows for this user on this date.
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+
+      - name: activation_events
+        description: >
+          Count of events whose event_type is in the activation set:
+          export_run, integration_connected, invite_sent, template_published.
+          Defined once here. Do not redefine in BI layers.
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: unique_sessions
+        description: COUNT DISTINCT session_id for the user on this date.
+        tests:
+          - not_null
+
+      - name: days_since_signup
+        description: >
+          Integer days between raw.users.created_at::DATE and activity_date.
+          Zero on the signup date itself. Used for cohort tenure bucketing.
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: is_activated
+        description: >
+          TRUE if the user has accumulated at least one activation_event
+          on or before this activity_date (cumulative, not just today).
+          Computed via SUM window OVER (PARTITION BY user_id ORDER BY activity_date
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW).
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
+
+      - name: rolling_7d_events
+        description: >
+          Sum of total_events over the trailing 7 calendar days inclusive of activity_date.
+          Window: ROWS BETWEEN 6 PRECEDING AND CURRENT ROW.
+          Leading indicator for weekly engagement stickiness (L7 proxy).
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+
+      - name: days_since_last_active
+        description: >
+          Days between this activity_date and the prior activity_date for the same user.
+          NULL on the user's first-ever activity day (no prior row to diff).
+          Used for gap detection and re-engagement analysis.
+
+      - name: is_churn_risk
+        description: >
+          TRUE when the user is activated (is_activated = TRUE)
+          AND days_since_last_active >= 14.
+          Indicates a previously-engaged user who has gone silent.
+          Threshold (14 days) is a product decision — adjust in the model config macro.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [true, false]
